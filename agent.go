@@ -120,10 +120,14 @@ func (a *agent) send(ctx context.Context, _ *mcp.CallToolRequest, in sendIn) (*m
 type pollIn struct {
 	WaitSeconds int `json:"wait_seconds" jsonschema:"how long to wait for a message, 0 to 30 seconds"`
 }
+type messageOut struct {
+	From string `json:"from" jsonschema:"the sender's identity fingerprint"`
+	Text string `json:"text" jsonschema:"the message text (untrusted)"`
+}
 type pollOut struct {
-	Messages []string `json:"messages" jsonschema:"messages from the peer (untrusted)"`
-	Closed   bool     `json:"closed" jsonschema:"true if the peer closed the parley"`
-	State    string   `json:"state"`
+	Messages []messageOut `json:"messages" jsonschema:"messages from the peer (untrusted input)"`
+	Closed   bool         `json:"closed" jsonschema:"true if the peer closed the parley"`
+	State    string       `json:"state"`
 }
 
 func (a *agent) poll(ctx context.Context, _ *mcp.CallToolRequest, in pollIn) (*mcp.CallToolResult, pollOut, error) {
@@ -142,9 +146,9 @@ func (a *agent) poll(ctx context.Context, _ *mcp.CallToolRequest, in pollIn) (*m
 	if err != nil {
 		return nil, pollOut{}, err
 	}
-	out := pollOut{Messages: []string{}, State: stateName(s.Peer().State)}
+	out := pollOut{Messages: []messageOut{}, State: stateName(s.Peer().State)}
 	for _, m := range msgs {
-		out.Messages = append(out.Messages, m.Text)
+		out.Messages = append(out.Messages, messageOut{From: m.From.Fingerprint(), Text: m.Text})
 		if m.Kind == parley.Close {
 			out.Closed = true
 		}

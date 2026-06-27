@@ -28,7 +28,7 @@ func pollMsg(ctx context.Context, a *agent) (text string, closed bool, err error
 			return "", false, err
 		}
 		if len(out.Messages) > 0 {
-			return out.Messages[0], out.Closed, nil
+			return out.Messages[0].Text, out.Closed, nil
 		}
 		if out.Closed {
 			return "", true, nil
