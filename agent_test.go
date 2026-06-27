@@ -20,10 +20,29 @@ func testAgent(t *testing.T, relay *relayhttp.Client) *agent {
 	return newAgent(kp, relay, "parley.test")
 }
 
-// TestAgentsTalkThroughTools drives two agents entirely through the MCP tool
-// handlers, over a live relay, to confirm the server wiring matches the engine.
+// pollMsg drives one agent's poll tool until a message arrives or the parley closes.
+func pollMsg(ctx context.Context, a *agent) (text string, closed bool, err error) {
+	for {
+		_, out, err := a.poll(ctx, nil, pollIn{WaitSeconds: 2})
+		if err != nil {
+			return "", false, err
+		}
+		if len(out.Messages) > 0 {
+			return out.Messages[0], out.Closed, nil
+		}
+		if out.Closed {
+			return "", true, nil
+		}
+		if err := ctx.Err(); err != nil {
+			return "", false, err
+		}
+	}
+}
+
+// TestAgentsTalkThroughTools drives two agents through the MCP tool handlers,
+// over a live relay, using the non-blocking send/poll surface.
 func TestAgentsTalkThroughTools(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	srv := httptest.NewServer(relayhttp.NewServer().Handler())
 	defer srv.Close()
@@ -41,37 +60,45 @@ func TestAgentsTalkThroughTools(t *testing.T) {
 	}
 
 	var (
-		wg     sync.WaitGroup
-		errs   [2]error
-		bReply sayOut
-		aHeard recvOut
-		aFinal sayOut
+		wg      sync.WaitGroup
+		errs    [2]error
+		aHeard  string
+		bHeard  string
+		aClosed bool
 	)
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
-		_, out, err := b.say(ctx, nil, sayIn{Text: "hi a"})
+		if _, _, err := b.send(ctx, nil, sendIn{Text: "hi a"}); err != nil {
+			errs[0] = err
+			return
+		}
+		reply, _, err := pollMsg(ctx, b)
 		if err != nil {
 			errs[0] = err
 			return
 		}
-		bReply = out
+		bHeard = reply
 		_, _, errs[0] = b.close(ctx, nil, closeIn{Outcome: "settled"})
 	}()
 	go func() {
 		defer wg.Done()
-		_, heard, err := a.recv(ctx, nil, recvIn{})
+		heard, _, err := pollMsg(ctx, a)
 		if err != nil {
 			errs[1] = err
 			return
 		}
 		aHeard = heard
-		_, final, err := a.say(ctx, nil, sayIn{Text: "hi b"})
+		if _, _, err := a.send(ctx, nil, sendIn{Text: "hi b"}); err != nil {
+			errs[1] = err
+			return
+		}
+		_, closed, err := pollMsg(ctx, a)
 		if err != nil {
 			errs[1] = err
 			return
 		}
-		aFinal = final
+		aClosed = closed
 	}()
 	wg.Wait()
 
@@ -80,16 +107,16 @@ func TestAgentsTalkThroughTools(t *testing.T) {
 			t.Fatalf("conversation: %v", err)
 		}
 	}
-	if aHeard.Message != "hi a" {
-		t.Errorf("a heard %q", aHeard.Message)
+	if aHeard != "hi a" {
+		t.Errorf("a heard %q", aHeard)
 	}
-	if bReply.Reply != "hi b" {
-		t.Errorf("b heard %q", bReply.Reply)
+	if bHeard != "hi b" {
+		t.Errorf("b heard %q", bHeard)
 	}
-	if !aFinal.Closed {
+	if !aClosed {
 		t.Error("a did not observe the close")
 	}
-	if _, st, _ := a.status(ctx, nil, statusIn{}); st.State != "closed" {
-		t.Errorf("status = %q, want closed", st.State)
+	if _, st, _ := a.status(ctx, nil, statusIn{}); st.State != "closed" || !st.PeerPresent {
+		t.Errorf("status = %+v, want closed + present", st)
 	}
 }
