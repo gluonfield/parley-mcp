@@ -68,6 +68,9 @@ type openOut struct {
 func (a *agent) open(ctx context.Context, _ *mcp.CallToolRequest, in openIn) (*mcp.CallToolResult, openOut, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	if err := a.idle(); err != nil {
+		return nil, openOut{}, err
+	}
 	s := session.New(a.self, a.relay, a.host)
 	inv, err := s.Open(ctx, in.Topic)
 	if err != nil {
@@ -91,6 +94,9 @@ func (a *agent) join(ctx context.Context, _ *mcp.CallToolRequest, in joinIn) (*m
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	if err := a.idle(); err != nil {
+		return nil, joinOut{}, err
+	}
 	s := session.New(a.self, a.relay, a.host)
 	if err := s.Join(ctx, inv); err != nil {
 		return nil, joinOut{}, err
@@ -194,6 +200,16 @@ func (a *agent) status(_ context.Context, _ *mcp.CallToolRequest, _ statusIn) (*
 	}
 	p := s.Peer()
 	return nil, statusOut{State: stateName(p.State), Topic: p.Topic, Peer: p.Fingerprint, PeerPresent: p.Present}, nil
+}
+
+// idle returns an error if a parley is still in flight, so open/join don't
+// silently abandon one (orphaning its relay seat and denying the peer a close).
+// The caller must hold a.mu.
+func (a *agent) idle() error {
+	if a.sess != nil && a.sess.Peer().State != parley.Closed {
+		return fmt.Errorf("already in a parley; close it first")
+	}
+	return nil
 }
 
 func (a *agent) current() (*session.Session, error) {

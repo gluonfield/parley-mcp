@@ -39,6 +39,35 @@ func pollMsg(ctx context.Context, a *agent) (text string, closed bool, err error
 	}
 }
 
+// TestOpenWhileBusyRefused confirms a second open/join is rejected rather than
+// silently abandoning an in-flight parley.
+func TestOpenWhileBusyRefused(t *testing.T) {
+	ctx := context.Background()
+	srv := httptest.NewServer(relayhttp.NewServer().Handler())
+	defer srv.Close()
+	a := testAgent(t, relayhttp.NewClient(srv.URL))
+
+	_, opened, err := a.open(ctx, nil, openIn{Topic: "first"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := a.open(ctx, nil, openIn{Topic: "second"}); err == nil {
+		t.Fatal("second open silently replaced the live parley")
+	}
+	// A valid link (its own invite) so the rejection comes from the busy guard,
+	// not invite parsing.
+	if _, _, err := a.join(ctx, nil, joinIn{Link: opened.Invite}); err == nil {
+		t.Fatal("join silently replaced the live parley")
+	}
+	// After closing, opening again is allowed.
+	if _, _, err := a.close(ctx, nil, closeIn{Outcome: "done"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := a.open(ctx, nil, openIn{Topic: "third"}); err != nil {
+		t.Fatalf("open after close rejected: %v", err)
+	}
+}
+
 // TestAgentsTalkThroughTools drives two agents through the MCP tool handlers,
 // over a live relay, using the non-blocking send/poll surface.
 func TestAgentsTalkThroughTools(t *testing.T) {
