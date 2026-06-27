@@ -1,0 +1,4 @@
+# compiled binary
+/parley-mcp
+*.test
+*.out
