@@ -21,7 +21,7 @@ func main() {
 	host := flag.String("host", "", "relay host for invite links (default: from -relay)")
 	identity := flag.String("identity", defaultIdentityPath(), "node identity file (single-tenant)")
 	httpAddr := flag.String("http", "", "serve MCP over HTTP at this address (e.g. 127.0.0.1:7777) instead of stdio")
-	shared := flag.Bool("shared", false, "serve one shared no-auth HTTP endpoint; each connection supplies a Parley identity seed header")
+	shared := flag.Bool("shared", false, "serve one shared no-auth HTTP endpoint; optional Parley identity seed headers give stable nodes")
 	tenantsDir := flag.String("tenants", "", "deprecated alias for -shared; value ignored")
 	flag.Parse()
 

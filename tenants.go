@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
@@ -19,11 +20,13 @@ const (
 	mcpSessionIDHeader  = "Mcp-Session-Id"
 )
 
+var errSessionIdentityMismatch = errors.New("MCP session belongs to a different Parley identity")
+
 // tenants serves one shared, no-auth MCP endpoint to many users. Each
-// connection presents a self-asserted identity seed in identityHeader; equal
+// connection may present a self-asserted identity seed in identityHeader; equal
 // seeds derive the same parley node, and different seeds derive different
-// nodes. The seed is not a login credential and is not validated against an
-// account.
+// nodes. If no seed is presented, the request gets a fresh session-scoped node.
+// The seed is not a login credential and is not validated against an account.
 //
 // Custody tradeoff: while handling requests, this hosted process is the parley
 // node for that seed and holds the derived private key material in memory so it
@@ -44,7 +47,12 @@ type tenantNode struct {
 	agent  *agent
 }
 
-type tenantNodeContextKey struct{}
+type requestNode struct {
+	node *tenantNode
+	err  error
+}
+
+type requestNodeContextKey struct{}
 
 func newTenants(relay parley.Relay, host string) *tenants {
 	return &tenants{
@@ -58,28 +66,23 @@ func newTenants(relay parley.Relay, host string) *tenants {
 func (t *tenants) handler() http.Handler {
 	stream := mcp.NewStreamableHTTPHandler(t.serverFor, nil)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		seed, err := identitySeed(r)
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
-			return
-		}
-		node, err := t.node(seed)
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
+		if err := t.checkRequestIdentity(r); err != nil {
+			status := http.StatusBadRequest
+			if errors.Is(err, errSessionIdentityMismatch) {
+				status = http.StatusForbidden
+			}
+			http.Error(w, err.Error(), status)
 			return
 		}
 		sessionID := r.Header.Get(mcpSessionIDHeader)
-		if err := t.checkSession(sessionID, node.key); err != nil {
-			http.Error(w, err.Error(), http.StatusForbidden)
-			return
-		}
 
-		r = r.WithContext(context.WithValue(r.Context(), tenantNodeContextKey{}, node))
+		reqNode := new(requestNode)
+		r = r.WithContext(context.WithValue(r.Context(), requestNodeContextKey{}, reqNode))
 		rw := &statusWriter{ResponseWriter: w}
 		stream.ServeHTTP(rw, r)
 
-		if newSessionID := rw.Header().Get(mcpSessionIDHeader); newSessionID != "" {
-			t.bindSession(newSessionID, node.key)
+		if newSessionID := rw.Header().Get(mcpSessionIDHeader); newSessionID != "" && reqNode.node != nil {
+			t.bindSession(newSessionID, reqNode.node.key)
 		}
 		if r.Method == http.MethodDelete && sessionID != "" && rw.status == http.StatusNoContent {
 			t.unbindSession(sessionID)
@@ -88,29 +91,74 @@ func (t *tenants) handler() http.Handler {
 }
 
 func (t *tenants) serverFor(r *http.Request) *mcp.Server {
-	if node, ok := r.Context().Value(tenantNodeContextKey{}).(*tenantNode); ok {
-		return node.server
+	if reqNode, ok := r.Context().Value(requestNodeContextKey{}).(*requestNode); ok {
+		if reqNode.node == nil && reqNode.err == nil {
+			reqNode.node, reqNode.err = t.nodeFor(r)
+		}
+		if reqNode.err != nil {
+			return nil
+		}
+		return reqNode.node.server
 	}
-	seed, err := identitySeed(r)
-	if err != nil {
-		return nil
-	}
-	node, err := t.node(seed)
+	node, err := t.nodeFor(r)
 	if err != nil {
 		return nil
 	}
 	return node.server
 }
 
-// node returns the MCP server for seed, deriving the parley identity on demand
-// without writing key material to disk.
-func (t *tenants) node(seed string) (*tenantNode, error) {
-	self, err := noise.DeriveKeypair([]byte(seed))
+func (t *tenants) nodeFor(r *http.Request) (*tenantNode, error) {
+	if seed, ok, err := identitySeed(r); err != nil {
+		return nil, err
+	} else if ok {
+		self, err := noise.DeriveKeypair([]byte(seed))
+		if err != nil {
+			return nil, err
+		}
+		return t.node(self)
+	}
+
+	if sessionID := r.Header.Get(mcpSessionIDHeader); sessionID != "" {
+		if node := t.nodeForSession(sessionID); node != nil {
+			return node, nil
+		}
+	}
+
+	self, err := noise.GenerateKeypair()
 	if err != nil {
 		return nil, err
 	}
-	id := parley.Identity{Key: self.Public}.ID()
-	key := hex.EncodeToString(id[:])
+	return t.node(self)
+}
+
+func (t *tenants) checkRequestIdentity(r *http.Request) error {
+	seed, ok, err := identitySeed(r)
+	if err != nil {
+		return err
+	}
+	sessionID := r.Header.Get(mcpSessionIDHeader)
+	if sessionID == "" {
+		return nil
+	}
+	t.mu.Lock()
+	owner, mapped := t.sessions[sessionID]
+	t.mu.Unlock()
+	if !mapped || !ok {
+		return nil
+	}
+	key, err := nodeKeyForSeed(seed)
+	if err != nil {
+		return err
+	}
+	if owner != key {
+		return errSessionIdentityMismatch
+	}
+	return nil
+}
+
+// node returns the MCP server for self, building it on first use.
+func (t *tenants) node(self noise.Keypair) (*tenantNode, error) {
+	key := nodeKey(self)
 
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -125,6 +173,29 @@ func (t *tenants) node(seed string) (*tenantNode, error) {
 	return node, nil
 }
 
+func nodeKeyForSeed(seed string) (string, error) {
+	self, err := noise.DeriveKeypair([]byte(seed))
+	if err != nil {
+		return "", err
+	}
+	return nodeKey(self), nil
+}
+
+func nodeKey(self noise.Keypair) string {
+	id := parley.Identity{Key: self.Public}.ID()
+	return hex.EncodeToString(id[:])
+}
+
+func (t *tenants) nodeForSession(sessionID string) *tenantNode {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	key, ok := t.sessions[sessionID]
+	if !ok {
+		return nil
+	}
+	return t.nodes[key]
+}
+
 func (t *tenants) checkSession(sessionID, nodeKey string) error {
 	if sessionID == "" {
 		return nil
@@ -136,7 +207,7 @@ func (t *tenants) checkSession(sessionID, nodeKey string) error {
 		return nil
 	}
 	if owner != nodeKey {
-		return fmt.Errorf("MCP session belongs to a different Parley identity")
+		return errSessionIdentityMismatch
 	}
 	return nil
 }
@@ -153,15 +224,15 @@ func (t *tenants) unbindSession(sessionID string) {
 	delete(t.sessions, sessionID)
 }
 
-func identitySeed(r *http.Request) (string, error) {
+func identitySeed(r *http.Request) (string, bool, error) {
 	seed := strings.TrimSpace(r.Header.Get(identityHeader))
 	if seed == "" {
-		return "", fmt.Errorf("missing %s header", identityHeader)
+		return "", false, nil
 	}
 	if len(seed) < minIdentitySeedSize {
-		return "", fmt.Errorf("%s must be a high-entropy seed of at least %d bytes", identityHeader, minIdentitySeedSize)
+		return "", false, fmt.Errorf("%s must be a high-entropy seed of at least %d bytes", identityHeader, minIdentitySeedSize)
 	}
-	return seed, nil
+	return seed, true, nil
 }
 
 type statusWriter struct {

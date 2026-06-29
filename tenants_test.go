@@ -4,25 +4,26 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
-	"strings"
 	"testing"
+	"time"
 
 	"github.com/gluonfield/parley"
 	"github.com/gluonfield/parley/relayhttp"
+	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
 func TestTenantIdentitySeedsDeriveStableNodeIDs(t *testing.T) {
 	tn := newTenants(nil, "relay.example")
 
-	alice1, err := tn.node(testSeed("alice"))
+	alice1, err := tn.nodeFor(seedRequest(testSeed("alice")))
 	if err != nil {
 		t.Fatal(err)
 	}
-	alice2, err := tn.node(testSeed("alice"))
+	alice2, err := tn.nodeFor(seedRequest(testSeed("alice")))
 	if err != nil {
 		t.Fatal(err)
 	}
-	bob, err := tn.node(testSeed("bob"))
+	bob, err := tn.nodeFor(seedRequest(testSeed("bob")))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -45,11 +46,11 @@ func TestTenantNodesIsolateInFlightParleys(t *testing.T) {
 	defer srv.Close()
 	tn := newTenants(relayhttp.NewClient(srv.URL), "parley.test")
 
-	alice, err := tn.node(testSeed("alice"))
+	alice, err := tn.nodeFor(seedRequest(testSeed("alice")))
 	if err != nil {
 		t.Fatal(err)
 	}
-	bob, err := tn.node(testSeed("bob"))
+	bob, err := tn.nodeFor(seedRequest(testSeed("bob")))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -68,28 +69,66 @@ func TestTenantNodesIsolateInFlightParleys(t *testing.T) {
 	}
 }
 
-func TestTenantHTTPRequiresIdentitySeed(t *testing.T) {
+func TestTenantHTTPAllowsNoIdentitySeed(t *testing.T) {
 	tn := newTenants(nil, "relay.example")
-	req := httptest.NewRequest(http.MethodPost, "/mcp", nil)
-	rr := httptest.NewRecorder()
 
-	tn.handler().ServeHTTP(rr, req)
-
-	if rr.Code != http.StatusBadRequest {
-		t.Fatalf("status = %d, want %d", rr.Code, http.StatusBadRequest)
+	a, err := tn.nodeFor(httptest.NewRequest(http.MethodPost, "/mcp", nil))
+	if err != nil {
+		t.Fatal(err)
 	}
-	if !strings.Contains(rr.Body.String(), "missing "+identityHeader) {
-		t.Fatalf("body = %q, want missing identity header", rr.Body.String())
+	b, err := tn.nodeFor(httptest.NewRequest(http.MethodPost, "/mcp", nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if nodeID(a) == nodeID(b) {
+		t.Fatal("new requests without identity seeds should not share a node")
+	}
+
+	tn.bindSession("session-1", a.key)
+	req := httptest.NewRequest(http.MethodPost, "/mcp", nil)
+	req.Header.Set(mcpSessionIDHeader, "session-1")
+	got, err := tn.nodeFor(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != a {
+		t.Fatal("request with an existing MCP session did not reuse its anonymous node")
+	}
+}
+
+func TestTenantHTTPConnectsWithoutIdentitySeed(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	tn := newTenants(nil, "relay.example")
+	srv := httptest.NewServer(tn.handler())
+	defer srv.Close()
+
+	client := mcp.NewClient(&mcp.Implementation{Name: "test", Version: "0.1.0"}, nil)
+	session, err := client.Connect(ctx, &mcp.StreamableClientTransport{
+		Endpoint:             srv.URL,
+		DisableStandaloneSSE: true,
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+
+	tools, err := session.ListTools(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(tools.Tools) == 0 {
+		t.Fatal("no tools returned")
 	}
 }
 
 func TestTenantSessionBindingRejectsIdentitySwitch(t *testing.T) {
 	tn := newTenants(nil, "relay.example")
-	alice, err := tn.node(testSeed("alice"))
+	alice, err := tn.nodeFor(seedRequest(testSeed("alice")))
 	if err != nil {
 		t.Fatal(err)
 	}
-	bob, err := tn.node(testSeed("bob"))
+	bob, err := tn.nodeFor(seedRequest(testSeed("bob")))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -105,15 +144,22 @@ func TestTenantSessionBindingRejectsIdentitySwitch(t *testing.T) {
 
 func TestIdentitySeedHeader(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/mcp", nil)
+	if _, ok, err := identitySeed(req); ok || err != nil {
+		t.Fatalf("missing seed = ok %v err %v, want optional", ok, err)
+	}
+
 	req.Header.Set(identityHeader, "short")
-	if _, err := identitySeed(req); err == nil {
+	if _, _, err := identitySeed(req); err == nil {
 		t.Fatal("short identity seed accepted")
 	}
 
 	req.Header.Set(identityHeader, testSeed("alice"))
-	got, err := identitySeed(req)
+	got, ok, err := identitySeed(req)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatal("identity seed was not reported present")
 	}
 	if got != testSeed("alice") {
 		t.Fatalf("seed = %q", got)
@@ -126,4 +172,10 @@ func nodeID(node *tenantNode) parley.NodeID {
 
 func testSeed(label string) string {
 	return label + "-0123456789abcdef0123456789abcdef"
+}
+
+func seedRequest(seed string) *http.Request {
+	req := httptest.NewRequest(http.MethodPost, "/mcp", nil)
+	req.Header.Set(identityHeader, seed)
+	return req
 }
