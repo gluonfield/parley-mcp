@@ -19,31 +19,41 @@ import (
 func main() {
 	relayURL := flag.String("relay", "https://parley.chat", "relay base URL")
 	host := flag.String("host", "", "relay host for invite links (default: from -relay)")
-	identity := flag.String("identity", defaultIdentityPath(), "node identity file")
+	identity := flag.String("identity", defaultIdentityPath(), "node identity file (single-tenant)")
 	httpAddr := flag.String("http", "", "serve MCP over HTTP at this address (e.g. 127.0.0.1:7777) instead of stdio")
+	tenantsDir := flag.String("tenants", "", "serve one shared HTTP endpoint to many users: per-user identities are kept in this dir, keyed by each connection's bearer token")
 	flag.Parse()
 
-	self, err := loadIdentity(*identity)
-	if err != nil {
-		log.Fatal(err)
-	}
 	inviteHost := *host
 	if inviteHost == "" {
 		if u, err := url.Parse(*relayURL); err == nil {
 			inviteHost = u.Host
 		}
 	}
+	relay := relayhttp.NewClient(*relayURL)
 
-	a := newAgent(self, relayhttp.NewClient(*relayURL), inviteHost)
+	if *httpAddr != "" && *tenantsDir != "" {
+		mux := http.NewServeMux()
+		mux.Handle("/mcp", newTenants(*tenantsDir, relay, inviteHost).handler())
+		log.Printf("parley-mcp: multi-tenant MCP endpoint http://%s/mcp on relay %s", *httpAddr, *relayURL)
+		if err := http.ListenAndServe(*httpAddr, mux); err != nil {
+			log.Fatal(err)
+		}
+		return
+	}
+
+	self, err := loadIdentity(*identity)
+	if err != nil {
+		log.Fatal(err)
+	}
+	a := newAgent(self, relay, inviteHost)
 	server := mcp.NewServer(&mcp.Implementation{Name: "parley", Version: "0.1.0"}, nil)
 	a.register(server)
-
 	log.Printf("parley-mcp: node %s on relay %s", parley.Identity{Key: self.Public}.Fingerprint(), *relayURL)
 
 	if *httpAddr != "" {
-		handler := mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return server }, nil)
 		mux := http.NewServeMux()
-		mux.Handle("/mcp", handler)
+		mux.Handle("/mcp", mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return server }, nil))
 		log.Printf("parley-mcp: MCP endpoint http://%s/mcp", *httpAddr)
 		if err := http.ListenAndServe(*httpAddr, mux); err != nil {
 			log.Fatal(err)
