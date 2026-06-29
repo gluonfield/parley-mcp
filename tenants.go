@@ -1,105 +1,189 @@
 package main
 
 import (
-	"crypto/sha256"
+	"context"
 	"encoding/hex"
+	"fmt"
 	"net/http"
-	"path/filepath"
+	"strings"
 	"sync"
 
 	"github.com/gluonfield/parley"
+	"github.com/gluonfield/parley/noise"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
-// tenants serves one shared MCP endpoint to many users. Each connection carries
-// a bearer token identifying its user; the server holds a separate parley
-// identity (and in-flight parley) per user, minted on first use. This is the
-// shape a hosted relay's MCP wants — one URL every user adds, each acting as
-// themselves — the same way Linear or Slack scope a shared MCP per user.
+const (
+	identityHeader      = "Parley-Identity-Seed"
+	minIdentitySeedSize = 32
+	mcpSessionIDHeader  = "Mcp-Session-Id"
+)
+
+// tenants serves one shared, no-auth MCP endpoint to many users. Each
+// connection presents a self-asserted identity seed in identityHeader; equal
+// seeds derive the same parley node, and different seeds derive different
+// nodes. The seed is not a login credential and is not validated against an
+// account.
 //
-// The trade-off is custody: this server holds every user's parley private key,
-// just as a hosted Linear MCP holds each user's OAuth token. It is therefore
-// trusted, and belongs behind the same auth boundary as the rest of Jaz.
+// Custody tradeoff: while handling requests, this hosted process is the parley
+// node for that seed and holds the derived private key material in memory so it
+// can run the Noise handshake. That differs from the local-node threat model
+// where the private key never leaves the user's machine.
 type tenants struct {
-	dir   string
 	relay parley.Relay
 	host  string
 
-	// userID resolves a request to its authenticated user, or returns false to
-	// reject it. The default reads the Bearer token verbatim; a deployment
-	// behind Jaz auth swaps in a validator without touching the rest.
-	userID func(*http.Request) (string, bool)
-
-	mu      sync.Mutex
-	servers map[string]*mcp.Server
+	mu       sync.Mutex
+	nodes    map[string]*tenantNode
+	sessions map[string]string
 }
 
-func newTenants(dir string, relay parley.Relay, host string) *tenants {
+type tenantNode struct {
+	key    string
+	server *mcp.Server
+	agent  *agent
+}
+
+type tenantNodeContextKey struct{}
+
+func newTenants(relay parley.Relay, host string) *tenants {
 	return &tenants{
-		dir:     dir,
-		relay:   relay,
-		host:    host,
-		userID:  bearerUser,
-		servers: make(map[string]*mcp.Server),
+		relay:    relay,
+		host:     host,
+		nodes:    make(map[string]*tenantNode),
+		sessions: make(map[string]string),
 	}
 }
 
-// handler is the multi-tenant MCP endpoint: it authenticates the user, then
-// lets the streamable transport drive that user's own server.
 func (t *tenants) handler() http.Handler {
 	stream := mcp.NewStreamableHTTPHandler(t.serverFor, nil)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if _, ok := t.userID(r); !ok {
-			http.Error(w, "missing or invalid bearer token", http.StatusUnauthorized)
+		seed, err := identitySeed(r)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
-		stream.ServeHTTP(w, r)
+		node, err := t.node(seed)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		sessionID := r.Header.Get(mcpSessionIDHeader)
+		if err := t.checkSession(sessionID, node.key); err != nil {
+			http.Error(w, err.Error(), http.StatusForbidden)
+			return
+		}
+
+		r = r.WithContext(context.WithValue(r.Context(), tenantNodeContextKey{}, node))
+		rw := &statusWriter{ResponseWriter: w}
+		stream.ServeHTTP(rw, r)
+
+		if newSessionID := rw.Header().Get(mcpSessionIDHeader); newSessionID != "" {
+			t.bindSession(newSessionID, node.key)
+		}
+		if r.Method == http.MethodDelete && sessionID != "" && rw.status == http.StatusNoContent {
+			t.unbindSession(sessionID)
+		}
 	})
 }
 
 func (t *tenants) serverFor(r *http.Request) *mcp.Server {
-	uid, ok := t.userID(r)
-	if !ok {
-		return nil
+	if node, ok := r.Context().Value(tenantNodeContextKey{}).(*tenantNode); ok {
+		return node.server
 	}
-	s, err := t.server(uid)
+	seed, err := identitySeed(r)
 	if err != nil {
 		return nil
 	}
-	return s
+	node, err := t.node(seed)
+	if err != nil {
+		return nil
+	}
+	return node.server
 }
 
-// server returns the user's MCP server, building it (and minting their identity)
-// the first time. One server per user persists their in-flight parley across the
-// many requests of a session.
-func (t *tenants) server(uid string) (*mcp.Server, error) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	if s, ok := t.servers[uid]; ok {
-		return s, nil
-	}
-	self, err := loadIdentity(t.identityPath(uid))
+// node returns the MCP server for seed, deriving the parley identity on demand
+// without writing key material to disk.
+func (t *tenants) node(seed string) (*tenantNode, error) {
+	self, err := noise.DeriveKeypair([]byte(seed))
 	if err != nil {
 		return nil, err
 	}
-	s := mcp.NewServer(&mcp.Implementation{Name: "parley", Version: "0.1.0"}, nil)
-	newAgent(self, t.relay, t.host).register(s)
-	t.servers[uid] = s
-	return s, nil
-}
+	id := parley.Identity{Key: self.Public}.ID()
+	key := hex.EncodeToString(id[:])
 
-// identityPath keys a user's key file by the hash of their id, so the token
-// itself never lands on disk as a filename.
-func (t *tenants) identityPath(uid string) string {
-	sum := sha256.Sum256([]byte(uid))
-	return filepath.Join(t.dir, hex.EncodeToString(sum[:])+".json")
-}
-
-func bearerUser(r *http.Request) (string, bool) {
-	const prefix = "Bearer "
-	h := r.Header.Get("Authorization")
-	if len(h) <= len(prefix) || h[:len(prefix)] != prefix {
-		return "", false
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if node, ok := t.nodes[key]; ok {
+		return node, nil
 	}
-	return h[len(prefix):], true
+	s := mcp.NewServer(&mcp.Implementation{Name: "parley", Version: "0.1.0"}, nil)
+	a := newAgent(self, t.relay, t.host)
+	a.register(s)
+	node := &tenantNode{key: key, server: s, agent: a}
+	t.nodes[key] = node
+	return node, nil
+}
+
+func (t *tenants) checkSession(sessionID, nodeKey string) error {
+	if sessionID == "" {
+		return nil
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	owner, ok := t.sessions[sessionID]
+	if !ok {
+		return nil
+	}
+	if owner != nodeKey {
+		return fmt.Errorf("MCP session belongs to a different Parley identity")
+	}
+	return nil
+}
+
+func (t *tenants) bindSession(sessionID, nodeKey string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.sessions[sessionID] = nodeKey
+}
+
+func (t *tenants) unbindSession(sessionID string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	delete(t.sessions, sessionID)
+}
+
+func identitySeed(r *http.Request) (string, error) {
+	seed := strings.TrimSpace(r.Header.Get(identityHeader))
+	if seed == "" {
+		return "", fmt.Errorf("missing %s header", identityHeader)
+	}
+	if len(seed) < minIdentitySeedSize {
+		return "", fmt.Errorf("%s must be a high-entropy seed of at least %d bytes", identityHeader, minIdentitySeedSize)
+	}
+	return seed, nil
+}
+
+type statusWriter struct {
+	http.ResponseWriter
+	status int
+}
+
+func (w *statusWriter) WriteHeader(status int) {
+	if w.status != 0 {
+		return
+	}
+	w.status = status
+	w.ResponseWriter.WriteHeader(status)
+}
+
+func (w *statusWriter) Write(b []byte) (int, error) {
+	if w.status == 0 {
+		w.status = http.StatusOK
+	}
+	return w.ResponseWriter.Write(b)
+}
+
+func (w *statusWriter) Unwrap() http.ResponseWriter {
+	return w.ResponseWriter
 }

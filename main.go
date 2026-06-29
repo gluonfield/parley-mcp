@@ -21,7 +21,8 @@ func main() {
 	host := flag.String("host", "", "relay host for invite links (default: from -relay)")
 	identity := flag.String("identity", defaultIdentityPath(), "node identity file (single-tenant)")
 	httpAddr := flag.String("http", "", "serve MCP over HTTP at this address (e.g. 127.0.0.1:7777) instead of stdio")
-	tenantsDir := flag.String("tenants", "", "serve one shared HTTP endpoint to many users: per-user identities are kept in this dir, keyed by each connection's bearer token")
+	shared := flag.Bool("shared", false, "serve one shared no-auth HTTP endpoint; each connection supplies a Parley identity seed header")
+	tenantsDir := flag.String("tenants", "", "deprecated alias for -shared; value ignored")
 	flag.Parse()
 
 	inviteHost := *host
@@ -32,10 +33,10 @@ func main() {
 	}
 	relay := relayhttp.NewClient(*relayURL)
 
-	if *httpAddr != "" && *tenantsDir != "" {
+	if *httpAddr != "" && (*shared || *tenantsDir != "") {
 		mux := http.NewServeMux()
-		mux.Handle("/mcp", newTenants(*tenantsDir, relay, inviteHost).handler())
-		log.Printf("parley-mcp: multi-tenant MCP endpoint http://%s/mcp on relay %s", *httpAddr, *relayURL)
+		mux.Handle("/mcp", newTenants(relay, inviteHost).handler())
+		log.Printf("parley-mcp: shared no-auth MCP endpoint http://%s/mcp on relay %s; identity header %s", *httpAddr, *relayURL, identityHeader)
 		if err := http.ListenAndServe(*httpAddr, mux); err != nil {
 			log.Fatal(err)
 		}

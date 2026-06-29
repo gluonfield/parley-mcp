@@ -3,7 +3,7 @@ module github.com/gluonfield/parley-mcp
 go 1.26
 
 require (
-	github.com/gluonfield/parley v0.2.0
+	github.com/gluonfield/parley v0.2.2-0.20260629175308-424958ca0c74
 	github.com/modelcontextprotocol/go-sdk v1.6.1
 )
 
