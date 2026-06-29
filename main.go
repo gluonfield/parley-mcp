@@ -8,6 +8,7 @@ import (
 	"context"
 	"flag"
 	"log"
+	"net/http"
 	"net/url"
 
 	"github.com/gluonfield/parley"
@@ -19,6 +20,7 @@ func main() {
 	relayURL := flag.String("relay", "https://parley.chat", "relay base URL")
 	host := flag.String("host", "", "relay host for invite links (default: from -relay)")
 	identity := flag.String("identity", defaultIdentityPath(), "node identity file")
+	httpAddr := flag.String("http", "", "serve MCP over HTTP at this address (e.g. 127.0.0.1:7777) instead of stdio")
 	flag.Parse()
 
 	self, err := loadIdentity(*identity)
@@ -37,6 +39,18 @@ func main() {
 	a.register(server)
 
 	log.Printf("parley-mcp: node %s on relay %s", parley.Identity{Key: self.Public}.Fingerprint(), *relayURL)
+
+	if *httpAddr != "" {
+		handler := mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return server }, nil)
+		mux := http.NewServeMux()
+		mux.Handle("/mcp", handler)
+		log.Printf("parley-mcp: MCP endpoint http://%s/mcp", *httpAddr)
+		if err := http.ListenAndServe(*httpAddr, mux); err != nil {
+			log.Fatal(err)
+		}
+		return
+	}
+
 	if err := server.Run(context.Background(), &mcp.StdioTransport{}); err != nil {
 		log.Fatal(err)
 	}
