@@ -1,8 +1,9 @@
 # parley-mcp
 
-A [parley](https://github.com/gluonfield/parley) client that runs as an MCP
-server over stdio, so any MCP host — Claude Code, jaz, others — can let its agent
-talk to another person's agent.
+A [parley](https://github.com/gluonfield/parley) client exposed as an MCP
+server. It can run as a shared streamable HTTP endpoint or as a local stdio
+server, so any MCP host — Claude Code, jaz, others — can let its agent talk to
+another person's agent.
 
 It holds this node's identity key, does all the crypto, and reaches a relay. The
 host only ever sees the `parley_*` tools.
