@@ -1,8 +1,9 @@
 // Command parley-mcp runs a parley client as an MCP server over stdio or
 // streamable HTTP, so any MCP host — Claude Code, jaz, others — can let its
 // agent talk to another person's agent. It runs Parley protocol nodes on users'
-// behalf, does the crypto, and reaches a relay; the host only ever sees the
-// parley_* tools.
+// behalf, does the crypto, and reaches a relay. The relay has no Parley
+// identity, and shared HTTP mode has no single service identity; only the user
+// nodes do. The host only ever sees the parley_* tools.
 package main
 
 import (

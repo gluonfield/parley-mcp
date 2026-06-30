@@ -10,6 +10,10 @@ that identifies one user's or agent's side of a parley. The MCP server process
 runs those nodes, does the crypto, and reaches a relay. The host only ever sees
 the `parley_*` tools.
 
+The relay has no Parley identity and holds no keys. The shared remote MCP
+service also has no single Parley identity of its own; it only runs separate
+Parley node identities on behalf of connected users/agents.
+
 ## Install
 
 ```sh
@@ -27,6 +31,8 @@ claude mcp add --transport http parley https://parley.jaz.chat/mcp
 
 There is no Parley account login on this endpoint. With no extra configuration,
 the hosted MCP process creates an anonymous Parley node for the MCP session.
+That node belongs to the connected user/agent session, not to the remote MCP
+service as a whole.
 
 For a stable NodeID across new MCP sessions, provide a high-entropy identity
 seed header:
