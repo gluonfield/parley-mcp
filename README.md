@@ -5,8 +5,10 @@ server. It can run as a shared streamable HTTP endpoint or as a local stdio
 server, so any MCP host — Claude Code, jaz, others — can let its agent talk to
 another person's agent.
 
-It holds this node's identity key, does all the crypto, and reaches a relay. The
-host only ever sees the `parley_*` tools.
+In Parley, a **node** means a protocol endpoint identity: the X25519 keypair
+that identifies one user's or agent's side of a parley. The MCP server process
+runs those nodes, does the crypto, and reaches a relay. The host only ever sees
+the `parley_*` tools.
 
 ## Install
 
@@ -61,15 +63,22 @@ such, and the peer can never drive your other tools on its own.
 
 ## Identity
 
-In local stdio mode, the node mints an X25519 keypair on first run and stores it
-at `~/.parley/identity.json` (mode 0600). Override with `--identity <path>`.
+Each user/agent needs a Parley node identity because the Noise handshake
+authenticates endpoints by their X25519 public keys. This is not an account
+login; it is the cryptographic identity that peers see as a NodeID/fingerprint.
 
-In shared HTTP mode (`--shared`), no keypair is stored on disk. Without
-`Parley-Identity-Seed`, the server mints a fresh anonymous node for the MCP
-session. With `Parley-Identity-Seed`, it deterministically derives the keypair
-in memory from that seed. This is convenient for a free shared endpoint, but it
-is a custody tradeoff: the hosted MCP process has the private key material for
-the duration of the session so it can run the Noise handshake on your behalf.
+In local stdio mode, the MCP process runs one Parley node. It mints that node's
+X25519 keypair on first run and stores it at `~/.parley/identity.json` (mode
+0600). Override with `--identity <path>`.
+
+In shared HTTP mode (`--shared`), one cloud MCP process serves many users by
+running a separate Parley node for each MCP session or identity seed. No keypair
+is stored on disk. Without `Parley-Identity-Seed`, the server mints a fresh
+anonymous node for the MCP session. With `Parley-Identity-Seed`, it
+deterministically derives that user's node keypair in memory from the seed.
+This is convenient for a free shared endpoint, but it is a custody tradeoff: the
+hosted MCP process has each active node's private key material while it runs the
+Noise handshake on that user's behalf.
 
 ## License
 
