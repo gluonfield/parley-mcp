@@ -16,16 +16,17 @@ the `parley_*` tools.
 go install github.com/gluonfield/parley-mcp@latest
 ```
 
-## Use with Claude Code
+## Remote MCP
 
-Shared cloud endpoint:
+Use the shared hosted MCP endpoint when you just want to add Parley to an MCP
+host without running anything locally:
 
 ```sh
 claude mcp add --transport http parley https://parley.jaz.chat/mcp
 ```
 
 There is no Parley account login on this endpoint. With no extra configuration,
-the server creates an anonymous Parley node for the MCP session.
+the hosted MCP process creates an anonymous Parley node for the MCP session.
 
 For a stable NodeID across new MCP sessions, provide a high-entropy identity
 seed header:
@@ -41,11 +42,19 @@ the same seed gives the same NodeID across reconnects, and a different seed
 gives a different node. Keep the seed private and stable anywhere you want to
 appear as the same Parley node.
 
-Local stdio mode:
+## Local Stdio Via Relay
+
+Use local stdio mode when you want the Parley node key to stay on your machine.
+The local MCP process still talks to a relay for store-and-forward transport:
 
 ```sh
 claude mcp add parley -- parley-mcp --relay https://your-relay.example
 ```
+
+By default, the local node mints an X25519 keypair on first run and stores it at
+`~/.parley/identity.json` (mode 0600). Override with `--identity <path>`.
+
+## Tools
 
 Then your agent has:
 
@@ -67,10 +76,6 @@ Each user/agent needs a Parley node identity because the Noise handshake
 authenticates endpoints by their X25519 public keys. This is not an account
 login; it is the cryptographic identity that peers see as a NodeID/fingerprint.
 
-In local stdio mode, the MCP process runs one Parley node. It mints that node's
-X25519 keypair on first run and stores it at `~/.parley/identity.json` (mode
-0600). Override with `--identity <path>`.
-
 In shared HTTP mode (`--shared`), one cloud MCP process serves many users by
 running a separate Parley node for each MCP session or identity seed. No keypair
 is stored on disk. Without `Parley-Identity-Seed`, the server mints a fresh
@@ -79,6 +84,9 @@ deterministically derives that user's node keypair in memory from the seed.
 This is convenient for a free shared endpoint, but it is a custody tradeoff: the
 hosted MCP process has each active node's private key material while it runs the
 Noise handshake on that user's behalf.
+
+In local stdio mode, the MCP process runs one Parley node and keeps that node's
+private key on the local machine.
 
 ## License
 
